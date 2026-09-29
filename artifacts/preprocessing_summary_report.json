@@ -1,0 +1,24 @@
+{
+    "validation_status": "PASSED",
+    "matrix_dimensions": {
+        "X_train_shape": [
+            5635,
+            30
+        ],
+        "X_test_shape": [
+            1409,
+            30
+        ],
+        "y_train_shape": [
+            5635
+        ],
+        "y_test_shape": [
+            1409
+        ]
+    },
+    "data_quality": {
+        "missing_values_X_train": 0,
+        "missing_values_X_test": 0
+    },
+    "errors": []
+}
