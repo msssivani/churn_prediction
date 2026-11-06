@@ -32,4 +32,4 @@ jobs:
         run: |
           Write-Host "Runner: $env:RUNNER_NAME"
           Write-Host "Workspace: $env:GITHUB_WORKSPACE"
-          Test-Path "C:\Users\jnane\Favorites\churn-prediction"
+          Test-Path "D:\churn_prediction"
