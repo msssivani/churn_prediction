@@ -1,14 +1,29 @@
+import json
 import os
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
 import mlflow
 from mlflow.tracking import MlflowClient
 import yaml
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LIFECYCLE_REPORT_PATH = PROJECT_ROOT / "reports" / "lifecycle_report.json"
 
 
 def configure_mlflow(config):
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI") or config["mlflow"].get("tracking_uri")
     if tracking_uri:
         mlflow.set_tracking_uri(tracking_uri)
+
+
+def write_lifecycle_report(report):
+    LIFECYCLE_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LIFECYCLE_REPORT_PATH.open("w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=4)
+        report_file.write("\n")
 
 
 def automate_model_lifecycle():
@@ -42,6 +57,26 @@ def automate_model_lifecycle():
 
         if not models_staging:
             print("[INFO] No models in Staging. Nothing to promote.")
+            production_models = [
+                mv for mv in all_versions if mv.current_stage == "Production"
+            ]
+            production_version = (
+                int(production_models[0].version) if production_models else None
+            )
+            write_lifecycle_report(
+                {
+                    "status": "completed",
+                    "model_name": model_name,
+                    "candidate_version": None,
+                    "candidate_metric": None,
+                    "decision_metric": metric_to_optimize,
+                    "production_version_before": production_version,
+                    "production_version_after": production_version,
+                    "promoted": False,
+                    "reason": "No models were available in Staging.",
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             return True
 
         # 3. Select the best Staging model using the configured metric.
@@ -124,11 +159,47 @@ def automate_model_lifecycle():
                     archive_existing_versions=False,
                 )
 
+        final_versions = client.search_model_versions(f"name='{model_name}'")
+        production_after = [
+            mv for mv in final_versions if mv.current_stage == "Production"
+        ]
+        production_version_after = (
+            int(production_after[0].version) if production_after else None
+        )
+        write_lifecycle_report(
+            {
+                "status": "completed",
+                "model_name": model_name,
+                "candidate_version": int(best_model.version),
+                "candidate_metric": best_score,
+                "decision_metric": metric_to_optimize,
+                "production_version_before": (
+                    int(production_model.version) if production_model else None
+                ),
+                "production_version_after": production_version_after,
+                "promoted": move_to_production,
+                "reason": (
+                    "Candidate improved the configured production metric."
+                    if move_to_production
+                    else "Candidate did not improve the configured production metric."
+                ),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
         print("[SUCCESS] Automated Model Lifecycle execution complete!")
         return True
 
     except Exception as exc:
         print(f"[ERROR] Failed to automate model lifecycle: {exc}")
+        write_lifecycle_report(
+            {
+                "status": "failed",
+                "promoted": False,
+                "error": str(exc),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         return False
 
 
