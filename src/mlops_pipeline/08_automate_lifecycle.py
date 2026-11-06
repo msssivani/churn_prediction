@@ -1,380 +1,379 @@
 
-import json
-import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
 import mlflow
+from mlflow.tracking import MlflowClient
 import mlflow.sklearn
 import yaml
-from mlflow.tracking import MlflowClient
+import os
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-LIFECYCLE_REPORT_PATH = PROJECT_ROOT / "reports" / "lifecycle_report.json"
+# --------------------------------------------------
+# STEP 1: Load Configuration
+# --------------------------------------------------
+
+with open("config.yaml", "r") as file:
+    config = yaml.safe_load(file)
 
 
-def configure_mlflow(config):
-    tracking_uri = (
-        os.getenv("MLFLOW_TRACKING_URI")
-        or config["mlflow"].get("tracking_uri")
-    )
+# --------------------------------------------------
+# STEP 2: Configure MLflow
+# --------------------------------------------------
 
-    if tracking_uri:
-        mlflow.set_tracking_uri(tracking_uri)
+tracking_uri = (
+    os.getenv("MLFLOW_TRACKING_URI")
+    or config["mlflow"].get("tracking_uri")
+)
 
-    print(f"[INFO] MLflow Tracking URI: {mlflow.get_tracking_uri()}")
+if tracking_uri:
+    mlflow.set_tracking_uri(tracking_uri)
+
+client = MlflowClient()
+
+model_name = config["registry"]["model_name"]
+metric_to_optimize = config["registry"].get(
+    "metric_to_optimize", "recall"
+)
+
+print("\n[INFO] Starting Automated Model Lifecycle Manager...")
+print(f"[INFO] MLflow Tracking URI: {mlflow.get_tracking_uri()}")
 
 
-def write_lifecycle_report(report):
-    LIFECYCLE_REPORT_PATH.parent.mkdir(
-        parents=True, exist_ok=True
-    )
-
-    with LIFECYCLE_REPORT_PATH.open("w", encoding="utf-8") as f:
-        json.dump(report, f, indent=4)
-        f.write("\n")
-
+# --------------------------------------------------
+# STEP 3: Check Whether a Model Artifact Is Accessible
+# --------------------------------------------------
 
 def validate_model_artifact(model_name, version):
-    """
-    Verify that the registered model version can actually be loaded.
-    A model must pass this check before Production promotion.
-    """
 
     model_uri = f"models:/{model_name}/{version}"
 
-    print(f"[INFO] Validating model artifact: {model_uri}")
+    print(f"\n[INFO] Validating model artifact: {model_uri}")
 
     try:
-        model = mlflow.sklearn.load_model(model_uri)
-
-        if model is None:
-            print("[ERROR] Loaded model is empty.")
-            return False
+        mlflow.sklearn.load_model(model_uri)
 
         print(
             f"[SUCCESS] Version {version} artifact is accessible."
         )
+
         return True
 
-    except Exception as exc:
+    except Exception as error:
+
         print(
-            f"[ERROR] Version {version} artifact validation failed: {exc}"
+            f"[ERROR] Version {version} artifact validation failed: {error}"
         )
+
         return False
 
 
-def automate_model_lifecycle():
-    print("[INFO] Starting Automated Model Lifecycle Manager...")
+# --------------------------------------------------
+# STEP 4: Get All Model Versions
+# --------------------------------------------------
 
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+try:
+    versions = client.search_model_versions(
+        f"name='{model_name}'"
+    )
 
-    configure_mlflow(config)
+except Exception as error:
 
-    client = MlflowClient()
+    print(f"[ERROR] Could not retrieve model versions: {error}")
+    raise
 
-    model_name = config["registry"]["model_name"]
-    metric_to_optimize = config["registry"]["decision_metric"]
+if not versions:
+    print("[WARNING] No registered model versions found.")
+    raise SystemExit(0)
 
-    try:
+print(f"[INFO] Found {len(versions)} model versions.")
 
-        # STEP 1: Retrieve registered model versions.
-        all_versions = client.search_model_versions(
-            f"name='{model_name}'"
-        )
 
-        if not all_versions:
-            print("[ERROR] No registered model versions found.")
-            return False
+# --------------------------------------------------
+# STEP 5: Move New Models to Staging
+# --------------------------------------------------
 
-        print(f"[INFO] Found {len(all_versions)} model versions.")
+for version in versions:
 
-        # STEP 2: Move newly registered models to Staging.
-        new_models = [
-            mv for mv in all_versions
-            if mv.current_stage == "None"
-        ]
+    if version.current_stage == "None":
 
-        for mv in new_models:
+        try:
             client.transition_model_version_stage(
                 name=model_name,
-                version=mv.version,
-                stage="Staging",
-                archive_existing_versions=False,
+                version=version.version,
+                stage="Staging"
             )
 
-            print(f"[INFO] Version {mv.version} moved to Staging.")
-
-        # Refresh version information.
-        all_versions = client.search_model_versions(
-            f"name='{model_name}'"
-        )
-
-        # STEP 3: Identify Staging and Production models.
-        staging_models = [
-            mv for mv in all_versions
-            if mv.current_stage == "Staging"
-        ]
-
-        production_models = [
-            mv for mv in all_versions
-            if mv.current_stage == "Production"
-        ]
-
-        production_model = (
-            production_models[0] if production_models else None
-        )
-
-        production_before = (
-            int(production_model.version)
-            if production_model else None
-        )
-
-        if not staging_models:
-            print("[INFO] No models available in Staging.")
-
-            write_lifecycle_report({
-                "status": "completed",
-                "model_name": model_name,
-                "candidate_version": None,
-                "candidate_metric": None,
-                "decision_metric": metric_to_optimize,
-                "production_version_before": production_before,
-                "production_version_after": production_before,
-                "promoted": False,
-                "reason": "No models were available in Staging.",
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-            })
-
-            return True
-
-        # STEP 4: Validate artifacts and evaluate Staging models.
-        valid_candidates = []
-
-        for mv in staging_models:
-
-            print(f"\n[INFO] Checking Version {mv.version}")
-
-            print(f"[INFO] Model source: {mv.source}")
-
-            if mv.run_id:
-                run = client.get_run(mv.run_id)
-
-                print(
-                    f"[INFO] Run artifact URI: {run.info.artifact_uri}"
-                )
-
-                score = run.data.metrics.get(metric_to_optimize)
-
-            else:
-                print("[WARNING] Model has no associated Run ID.")
-                continue
-
-            if score is None:
-                print(
-                    f"[WARNING] Metric '{metric_to_optimize}' not found."
-                )
-                continue
-
-            # IMPORTANT: Validate artifact before considering promotion.
-            if not validate_model_artifact(
-                model_name, mv.version
-            ):
-                print(
-                    f"[WARNING] Version {mv.version} rejected "
-                    "because its artifact is inaccessible."
-                )
-                continue
-
-            valid_candidates.append((mv, float(score)))
-
-        # STEP 5: Select the best valid candidate.
-        if not valid_candidates:
             print(
-                "[ERROR] No Staging model has a valid accessible artifact."
+                f"[INFO] Version {version.version} moved to Staging."
             )
 
-            write_lifecycle_report({
-                "status": "failed",
-                "model_name": model_name,
-                "candidate_version": None,
-                "candidate_metric": None,
-                "decision_metric": metric_to_optimize,
-                "production_version_before": production_before,
-                "production_version_after": production_before,
-                "promoted": False,
-                "reason": "No Staging model passed artifact validation.",
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-            })
+        except Exception as error:
 
-            return False
+            print(
+                f"[ERROR] Could not move Version {version.version} "
+                f"to Staging: {error}"
+            )
 
-        best_model, best_score = max(
-            valid_candidates,
-            key=lambda item: item[1]
+
+# Refresh model versions after stage transitions
+versions = client.search_model_versions(
+    f"name='{model_name}'"
+)
+
+
+# --------------------------------------------------
+# STEP 6: Validate Staging Models and Find Best Model
+# --------------------------------------------------
+
+staging_models = [
+    version
+    for version in versions
+    if version.current_stage == "Staging"
+]
+
+valid_staging_models = []
+
+for version in staging_models:
+
+    print(f"\n[INFO] Checking Version {version.version}")
+
+    print(f"[INFO] Model source: {version.source}")
+
+    try:
+        run = client.get_run(version.run_id)
+        print(f"[INFO] Run Artifact URI: {run.info.artifact_uri}")
+
+        score = run.data.metrics.get(
+            metric_to_optimize
+        )
+
+        if score is None:
+            print(
+                f"[WARNING] Version {version.version} "
+                f"does not contain metric '{metric_to_optimize}'."
+            )
+            continue
+
+        if validate_model_artifact(
+            model_name,
+            version.version
+        ):
+
+            valid_staging_models.append(
+                (version, score)
+            )
+
+        else:
+
+            print(
+                f"[WARNING] Version {version.version} rejected "
+                "because its artifact is inaccessible."
+            )
+
+    except Exception as error:
+
+        print(
+            f"[ERROR] Could not check Version {version.version}: {error}"
+        )
+
+
+# --------------------------------------------------
+# STEP 7: Select Best Valid Staging Model
+# --------------------------------------------------
+
+if not valid_staging_models:
+
+    print(
+        "\n[WARNING] No valid Staging models available."
+    )
+
+    raise SystemExit(0)
+
+
+best_model, best_score = max(
+    valid_staging_models,
+    key=lambda item: item[1]
+)
+
+print(
+    f"\n[SUCCESS] Best valid Staging model: "
+    f"Version {best_model.version}"
+)
+
+print(
+    f"[INFO] Best {metric_to_optimize}: {best_score:.4f}"
+)
+
+
+# --------------------------------------------------
+# STEP 8: Validate Existing Production Model
+# --------------------------------------------------
+
+production_models = [
+    version
+    for version in versions
+    if version.current_stage == "Production"
+]
+
+production_model = (
+    max(production_models, key=lambda item: int(item.version))
+    if production_models
+    else None
+)
+
+move_to_production = False
+
+if production_model is None:
+
+    print("[INFO] No existing Production model found.")
+
+    move_to_production = True
+
+else:
+
+    print(
+        f"\n[INFO] Existing Production Version: "
+        f"{production_model.version}"
+    )
+
+    production_is_valid = validate_model_artifact(
+        model_name,
+        production_model.version
+    )
+
+    if not production_is_valid:
+
+        print(
+            "[WARNING] Existing Production model is inaccessible."
         )
 
         print(
-            f"\n[SUCCESS] Best valid Staging model: "
-            f"Version {best_model.version}"
+            "[INFO] A valid Staging model will replace it."
         )
 
-        print(
-            f"[INFO] Best {metric_to_optimize}: {best_score:.4f}"
+        move_to_production = True
+
+    else:
+
+        production_run = client.get_run(
+            production_model.run_id
         )
 
-        # STEP 6: Compare against current Production model.
-        if production_model is None:
+        production_score = production_run.data.metrics.get(
+            metric_to_optimize
+        )
+
+        if production_score is None:
+
+            print(
+                f"[WARNING] Production model does not contain "
+                f"'{metric_to_optimize}'."
+            )
 
             move_to_production = True
 
-            print(
-                "[INFO] No Production model exists. "
-                "Candidate will be promoted."
-            )
-
         else:
 
-            production_run = client.get_run(
-                production_model.run_id
-            )
-
-            production_score = production_run.data.metrics.get(
-                metric_to_optimize, 0.0
-            )
-
             print(
-                f"[INFO] Production Version "
-                f"{production_model.version} | "
-                f"{metric_to_optimize}={production_score:.4f}"
+                f"[INFO] Production {metric_to_optimize}: "
+                f"{production_score:.4f}"
             )
 
-            move_to_production = best_score > production_score
+            # Promote if the new model is better.
+            # Also promote when scores are equal.
+            move_to_production = (
+                best_score >= production_score
+            )
 
-        # STEP 7: Promote or archive the candidate.
-        if move_to_production:
 
-            # Validate once more immediately before promotion.
-            if not validate_model_artifact(
-                model_name, best_model.version
-            ):
-                print(
-                    "[ERROR] Final artifact validation failed. "
-                    "Promotion cancelled."
-                )
-                return False
+# --------------------------------------------------
+# STEP 9: Promote or Archive Models
+# --------------------------------------------------
 
+if move_to_production:
+
+    print(
+        f"\n[INFO] Promoting Version {best_model.version} "
+        "to Production..."
+    )
+
+    # Archive existing Production models
+    for version in production_models:
+
+        try:
             client.transition_model_version_stage(
                 name=model_name,
-                version=best_model.version,
-                stage="Production",
-                archive_existing_versions=False,
+                version=version.version,
+                stage="Archived"
             )
-
-            if production_model:
-                client.transition_model_version_stage(
-                    name=model_name,
-                    version=production_model.version,
-                    stage="Archived",
-                    archive_existing_versions=False,
-                )
 
             print(
-                f"[SUCCESS] Version {best_model.version} "
-                "is now Production."
+                f"[INFO] Previous Production Version "
+                f"{version.version} archived."
             )
 
-        else:
+        except Exception as error:
 
+            print(
+                f"[ERROR] Could not archive Production "
+                f"Version {version.version}: {error}"
+            )
+
+    # Promote best Staging model
+    client.transition_model_version_stage(
+        name=model_name,
+        version=best_model.version,
+        stage="Production"
+    )
+
+    print(
+        f"[SUCCESS] Version {best_model.version} "
+        "promoted to Production."
+    )
+
+else:
+
+    print(
+        "\n[INFO] Existing Production model is better."
+    )
+
+    print(
+        f"[INFO] Version {best_model.version} "
+        "will not replace Production."
+    )
+
+
+# --------------------------------------------------
+# STEP 10: Archive Remaining Staging Models
+# --------------------------------------------------
+
+versions = client.search_model_versions(
+    f"name='{model_name}'"
+)
+
+for version in versions:
+
+    if version.current_stage == "Staging":
+
+        try:
             client.transition_model_version_stage(
                 name=model_name,
-                version=best_model.version,
-                stage="Archived",
-                archive_existing_versions=False,
+                version=version.version,
+                stage="Archived"
             )
 
             print(
-                f"[INFO] Version {best_model.version} archived. "
-                "It did not improve Production."
+                f"[INFO] Version {version.version} moved to Archived."
             )
 
-        # STEP 8: Archive remaining Staging versions.
-        final_versions = client.search_model_versions(
-            f"name='{model_name}'"
-        )
+        except Exception as error:
 
-        for mv in final_versions:
-            if mv.current_stage == "Staging":
-
-                client.transition_model_version_stage(
-                    name=model_name,
-                    version=mv.version,
-                    stage="Archived",
-                    archive_existing_versions=False,
-                )
-
-                print(
-                    f"[INFO] Version {mv.version} moved to Archived."
-                )
-
-        # STEP 9: Generate lifecycle report.
-        final_versions = client.search_model_versions(
-            f"name='{model_name}'"
-        )
-
-        production_after = [
-            mv for mv in final_versions
-            if mv.current_stage == "Production"
-        ]
-
-        production_version_after = (
-            int(production_after[0].version)
-            if production_after else None
-        )
-
-        write_lifecycle_report({
-            "status": "completed",
-            "model_name": model_name,
-            "candidate_version": int(best_model.version),
-            "candidate_metric": best_score,
-            "decision_metric": metric_to_optimize,
-            "production_version_before": production_before,
-            "production_version_after": production_version_after,
-            "promoted": move_to_production,
-            "reason": (
-                "Candidate improved the configured production metric."
-                if move_to_production
-                else "Candidate did not improve the configured production metric."
-            ),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-        print(
-            "[SUCCESS] Automated Model Lifecycle execution complete!"
-        )
-
-        return True
-
-    except Exception as exc:
-
-        print(
-            f"[ERROR] Failed to automate model lifecycle: {exc}"
-        )
-
-        write_lifecycle_report({
-            "status": "failed",
-            "model_name": model_name,
-            "promoted": False,
-            "error": str(exc),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-        return False
+            print(
+                f"[ERROR] Could not archive Version "
+                f"{version.version}: {error}"
+            )
 
 
-if __name__ == "__main__":
-    passed = automate_model_lifecycle()
-    sys.exit(0 if passed else 1)
+# --------------------------------------------------
+# STEP 11: Execution Complete
+# --------------------------------------------------
+
+print("\n[SUCCESS] Automated Model Lifecycle execution complete!")
