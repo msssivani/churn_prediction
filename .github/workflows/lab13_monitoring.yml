@@ -16,7 +16,7 @@ jobs:
         shell: powershell
         run: |
           Set-Location "D:\churn_prediction"
-          & ".\venv\Scripts\python.exe" ".\src\mlops_pipeline\12_monitor_trigger.py"
+          & ".\.venv\Scripts\python.exe" ".\src\mlops_pipeline\12_monitor_trigger.py"
 
       - name: Show monitoring result
         shell: powershell
